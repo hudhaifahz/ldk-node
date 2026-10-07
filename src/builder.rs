@@ -2088,6 +2088,7 @@ fn build_with_store_internal(
 	let (stop_sender, _) = tokio::sync::watch::channel(());
 	let (background_processor_stop_sender, _) = tokio::sync::watch::channel(());
 	let is_running = Arc::new(RwLock::new(false));
+	let circular_payment_lock = Arc::new(Mutex::new(()));
 
 	let pathfinding_scores_sync_url = pathfinding_scores_sync_config.map(|c| c.url.clone());
 
@@ -2119,6 +2120,7 @@ fn build_with_store_internal(
 		peer_store,
 		payment_store,
 		is_running,
+		circular_payment_lock,
 		node_metrics,
 		om_mailbox,
 		async_payments_role,
