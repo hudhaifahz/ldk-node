@@ -46,7 +46,8 @@ use crate::logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger
 use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use crate::payment::asynchronous::static_invoice_store::StaticInvoiceStore;
 use crate::payment::store::{
-	PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind, PaymentStatus,
+	CircularPaymentFailureReason, PaymentDetails, PaymentDetailsUpdate, PaymentDirection,
+	PaymentKind, PaymentStatus,
 };
 use crate::runtime::Runtime;
 use crate::types::{
@@ -75,7 +76,7 @@ impl_writeable_tlv_based!(ReceivingChannel, {
 enum ChannelConstrainedClaimDecision {
 	NotConstrained,
 	Claim(PaymentPreimage),
-	Fail,
+	Fail(CircularPaymentFailureReason),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,7 +112,7 @@ fn apply_channel_constrained_claim_decision<A: ChannelConstrainedClaimActions>(
 			actions.claim(preimage);
 			ChannelConstrainedClaimOutcome::Claimed
 		},
-		ChannelConstrainedClaimDecision::Fail => {
+		ChannelConstrainedClaimDecision::Fail(_) => {
 			actions.fail(payment_hash);
 			ChannelConstrainedClaimOutcome::Failed
 		},
@@ -120,12 +121,29 @@ fn apply_channel_constrained_claim_decision<A: ChannelConstrainedClaimActions>(
 
 fn handle_channel_constrained_claim<A: ChannelConstrainedClaimActions>(
 	actions: &A, payment_store: &PaymentStore, payment_id: PaymentId, payment_hash: &PaymentHash,
-	decision: ChannelConstrainedClaimDecision,
+	decision: ChannelConstrainedClaimDecision, receiving_channel_ids: &[(ChannelId, Option<u128>)],
 ) -> Result<ChannelConstrainedClaimOutcome, Error> {
+	let failure_reason = match decision {
+		ChannelConstrainedClaimDecision::Fail(reason) => Some(reason),
+		_ => None,
+	};
 	let outcome = apply_channel_constrained_claim_decision(actions, payment_hash, decision);
 	if outcome == ChannelConstrainedClaimOutcome::Failed {
+		let observed_receiving_channel_ids = receiving_channel_ids
+			.iter()
+			.filter_map(|(_, user_channel_id)| user_channel_id.map(UserChannelId))
+			.collect();
+		let unidentified_count = receiving_channel_ids
+			.iter()
+			.filter(|(_, user_channel_id)| user_channel_id.is_none())
+			.count()
+			.try_into()
+			.unwrap_or(u32::MAX);
 		let update = PaymentDetailsUpdate {
 			status: Some(PaymentStatus::Failed),
+			circular_failure_reason: Some(failure_reason),
+			circular_observed_receiving_channel_ids: Some(observed_receiving_channel_ids),
+			circular_unidentified_receiving_channel_count: Some(unidentified_count),
 			..PaymentDetailsUpdate::new(payment_id)
 		};
 		payment_store.update(&update)?;
@@ -309,22 +327,41 @@ fn channel_constrained_claim_decision(
 		_ => return ChannelConstrainedClaimDecision::NotConstrained,
 	};
 
-	let amount_matches =
-		expected_amount_msat.map(|expected| actual_amount_msat == expected).unwrap_or(false);
-	let every_part_matches = !receiving_channel_ids.is_empty()
-		&& receiving_channel_ids
-			.iter()
-			.all(|(_, user_channel_id)| *user_channel_id == Some(required_channel_id.0));
-
-	match preimage.filter(|_| {
-		status == PaymentStatus::Pending
-			&& circular_metadata_matches
-			&& amount_matches
-			&& every_part_matches
-	}) {
-		Some(preimage) => ChannelConstrainedClaimDecision::Claim(preimage),
-		None => ChannelConstrainedClaimDecision::Fail,
+	if status != PaymentStatus::Pending {
+		return ChannelConstrainedClaimDecision::Fail(
+			CircularPaymentFailureReason::PaymentNotPending,
+		);
 	}
+	if !circular_metadata_matches {
+		return ChannelConstrainedClaimDecision::Fail(
+			CircularPaymentFailureReason::CircularMetadataMismatch,
+		);
+	}
+	if expected_amount_msat.map(|expected| actual_amount_msat != expected).unwrap_or(true) {
+		return ChannelConstrainedClaimDecision::Fail(CircularPaymentFailureReason::AmountMismatch);
+	}
+	let Some(preimage) = preimage else {
+		return ChannelConstrainedClaimDecision::Fail(
+			CircularPaymentFailureReason::MissingPreimage,
+		);
+	};
+	if receiving_channel_ids.is_empty()
+		|| receiving_channel_ids.iter().any(|(_, user_channel_id)| user_channel_id.is_none())
+	{
+		return ChannelConstrainedClaimDecision::Fail(
+			CircularPaymentFailureReason::MissingReceivingChannelIdentity,
+		);
+	}
+	if receiving_channel_ids
+		.iter()
+		.any(|(_, user_channel_id)| *user_channel_id != Some(required_channel_id.0))
+	{
+		return ChannelConstrainedClaimDecision::Fail(
+			CircularPaymentFailureReason::ReceivingChannelMismatch,
+		);
+	}
+
+	ChannelConstrainedClaimDecision::Claim(*preimage)
 }
 
 /// An event emitted by [`Node`], which should be handled by the user.
@@ -1048,6 +1085,7 @@ where
 						payment_id,
 						&payment_hash,
 						claim_decision,
+						receiving_channel_ids.as_slice(),
 					) {
 						Ok(outcome) => outcome,
 						Err(e) => {
@@ -2303,16 +2341,30 @@ mod tests {
 
 		let mixed_parts = vec![(ChannelId([1u8; 32]), Some(42)), (ChannelId([2u8; 32]), Some(43))];
 		let unidentified_part = vec![(ChannelId([1u8; 32]), None)];
-		for non_matching_parts in [&mixed_parts[..], &unidentified_part[..], &[]] {
+		assert_eq!(
+			channel_constrained_claim_decision(
+				&constrained,
+				PaymentStatus::Pending,
+				Some(20_000_000),
+				20_000_000,
+				&mixed_parts,
+			),
+			ChannelConstrainedClaimDecision::Fail(
+				CircularPaymentFailureReason::ReceivingChannelMismatch,
+			)
+		);
+		for unidentified_parts in [&unidentified_part[..], &[]] {
 			assert_eq!(
 				channel_constrained_claim_decision(
 					&constrained,
 					PaymentStatus::Pending,
 					Some(20_000_000),
 					20_000_000,
-					non_matching_parts,
+					unidentified_parts,
 				),
-				ChannelConstrainedClaimDecision::Fail
+				ChannelConstrainedClaimDecision::Fail(
+					CircularPaymentFailureReason::MissingReceivingChannelIdentity,
+				)
 			);
 		}
 		assert_eq!(
@@ -2323,7 +2375,7 @@ mod tests {
 				19_999_999,
 				&exact_parts
 			),
-			ChannelConstrainedClaimDecision::Fail
+			ChannelConstrainedClaimDecision::Fail(CircularPaymentFailureReason::AmountMismatch)
 		);
 		assert_eq!(
 			channel_constrained_claim_decision(
@@ -2333,7 +2385,7 @@ mod tests {
 				20_000_001,
 				&exact_parts,
 			),
-			ChannelConstrainedClaimDecision::Fail
+			ChannelConstrainedClaimDecision::Fail(CircularPaymentFailureReason::AmountMismatch)
 		);
 		assert_eq!(
 			channel_constrained_claim_decision(
@@ -2343,7 +2395,7 @@ mod tests {
 				20_000_000,
 				&exact_parts,
 			),
-			ChannelConstrainedClaimDecision::Fail
+			ChannelConstrainedClaimDecision::Fail(CircularPaymentFailureReason::AmountMismatch)
 		);
 		assert_eq!(
 			channel_constrained_claim_decision(
@@ -2353,7 +2405,7 @@ mod tests {
 				20_000_000,
 				&exact_parts,
 			),
-			ChannelConstrainedClaimDecision::Fail
+			ChannelConstrainedClaimDecision::Fail(CircularPaymentFailureReason::PaymentNotPending,)
 		);
 
 		let mut missing_preimage = constrained.clone();
@@ -2368,7 +2420,7 @@ mod tests {
 				20_000_000,
 				&exact_parts,
 			),
-			ChannelConstrainedClaimDecision::Fail
+			ChannelConstrainedClaimDecision::Fail(CircularPaymentFailureReason::MissingPreimage)
 		);
 
 		let mut missing_operation = constrained.clone();
@@ -2383,7 +2435,9 @@ mod tests {
 				20_000_000,
 				&exact_parts,
 			),
-			ChannelConstrainedClaimDecision::Fail
+			ChannelConstrainedClaimDecision::Fail(
+				CircularPaymentFailureReason::CircularMetadataMismatch,
+			)
 		);
 
 		let mut unconstrained = constrained;
@@ -2423,7 +2477,9 @@ mod tests {
 			apply_channel_constrained_claim_decision(
 				&actions,
 				&payment_hash,
-				ChannelConstrainedClaimDecision::Fail,
+				ChannelConstrainedClaimDecision::Fail(
+					CircularPaymentFailureReason::ReceivingChannelMismatch,
+				),
 			),
 			ChannelConstrainedClaimOutcome::Failed
 		);
@@ -2472,7 +2528,10 @@ mod tests {
 				&payment_store,
 				payment_id,
 				&payment_hash,
-				ChannelConstrainedClaimDecision::Fail,
+				ChannelConstrainedClaimDecision::Fail(
+					CircularPaymentFailureReason::ReceivingChannelMismatch,
+				),
+				&[(ChannelId([4u8; 32]), Some(41))],
 			)
 			.unwrap(),
 			ChannelConstrainedClaimOutcome::Failed
@@ -2483,6 +2542,11 @@ mod tests {
 		assert_eq!(reloaded.len(), 1);
 		assert_eq!(reloaded[0].id, payment_id);
 		assert_eq!(reloaded[0].status, PaymentStatus::Failed);
+		assert_eq!(
+			reloaded[0].circular_failure_reason,
+			Some(CircularPaymentFailureReason::ReceivingChannelMismatch)
+		);
+		assert_eq!(reloaded[0].circular_observed_receiving_channel_ids, vec![UserChannelId(41)]);
 	}
 
 	#[test]
@@ -3357,7 +3421,9 @@ mod tests {
 				amount_msat,
 				&wrong_receiving_channels,
 			),
-			ChannelConstrainedClaimDecision::Fail
+			ChannelConstrainedClaimDecision::Fail(
+				CircularPaymentFailureReason::ReceivingChannelMismatch,
+			)
 		);
 		fail_payment_along_route(&nodes[0], &[path], false, wrong_hash);
 
@@ -3487,7 +3553,9 @@ mod tests {
 				amount_msat,
 				&receiving_channels,
 			),
-			ChannelConstrainedClaimDecision::Fail
+			ChannelConstrainedClaimDecision::Fail(
+				CircularPaymentFailureReason::ReceivingChannelMismatch,
+			)
 		);
 		fail_payment_along_route(&nodes[0], &[path_a, path_b], false, payment_hash);
 	}
