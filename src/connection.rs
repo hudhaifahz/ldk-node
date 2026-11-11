@@ -15,6 +15,7 @@ use bitcoin::secp256k1::PublicKey;
 use lightning::ln::msgs::SocketAddress;
 
 use crate::logger::{log_error, log_info, LdkLogger};
+use crate::peer_transport::{self, SocksRoute};
 use crate::types::PeerManager;
 use crate::Error;
 
@@ -26,15 +27,18 @@ where
 		Mutex<HashMap<PublicKey, Vec<tokio::sync::oneshot::Sender<Result<(), Error>>>>>,
 	peer_manager: Arc<PeerManager>,
 	logger: L,
+	proxy_routes: HashMap<PublicKey, SocksRoute>,
 }
 
 impl<L: Deref + Clone + Sync + Send> ConnectionManager<L>
 where
 	L::Target: LdkLogger,
 {
-	pub(crate) fn new(peer_manager: Arc<PeerManager>, logger: L) -> Self {
+	pub(crate) fn new(
+		peer_manager: Arc<PeerManager>, logger: L, proxy_routes: HashMap<PublicKey, SocksRoute>,
+	) -> Self {
 		let pending_connections = Mutex::new(HashMap::new());
-		Self { pending_connections, peer_manager, logger }
+		Self { pending_connections, peer_manager, logger, proxy_routes }
 	}
 
 	pub(crate) async fn connect_peer_if_necessary(
@@ -64,25 +68,49 @@ where
 
 		log_info!(self.logger, "Connecting to peer: {}@{}", node_id, addr);
 
-		let socket_addr = addr
-			.to_socket_addrs()
-			.map_err(|e| {
-				log_error!(self.logger, "Failed to resolve network address {}: {}", addr, e);
-				self.propagate_result_to_subscribers(&node_id, Err(Error::InvalidSocketAddress));
-				Error::InvalidSocketAddress
-			})?
-			.next()
-			.ok_or_else(|| {
-				log_error!(self.logger, "Failed to resolve network address {}", addr);
-				self.propagate_result_to_subscribers(&node_id, Err(Error::InvalidSocketAddress));
-				Error::InvalidSocketAddress
-			})?;
-
-		let connection_future = lightning_net_tokio::connect_outbound(
-			Arc::clone(&self.peer_manager),
-			node_id,
-			socket_addr,
-		);
+		let connection_future = async {
+			let stream = if let Some(route) = self.proxy_routes.get(&node_id) {
+				// SOCKS success must precede setup_outbound, which starts LDK's handshake timer.
+				match peer_transport::connect(route).await {
+					Ok(stream) => stream,
+					Err(error) => {
+						log_error!(
+							self.logger,
+							"Tor transport failed for peer {}: {}",
+							node_id,
+							error
+						);
+						return None;
+					},
+				}
+			} else {
+				let socket_addr =
+					match addr.to_socket_addrs().ok().and_then(|mut addrs| addrs.next()) {
+						Some(addr) => addr,
+						None => {
+							log_error!(self.logger, "Failed to resolve network address {}", addr);
+							return None;
+						},
+					};
+				match tokio::time::timeout(
+					Duration::from_secs(10),
+					tokio::net::TcpStream::connect(socket_addr),
+				)
+				.await
+				{
+					Ok(Ok(stream)) => match stream.into_std() {
+						Ok(stream) => stream,
+						Err(_) => return None,
+					},
+					_ => return None,
+				}
+			};
+			Some(lightning_net_tokio::setup_outbound(
+				Arc::clone(&self.peer_manager),
+				node_id,
+				stream,
+			))
+		};
 
 		let res = match connection_future.await {
 			Some(connection_closed_future) => {

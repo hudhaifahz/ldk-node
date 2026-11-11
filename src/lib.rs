@@ -95,7 +95,9 @@ pub mod liquidity;
 pub mod logger;
 mod message_handler;
 pub mod payment;
+mod peer_retry;
 mod peer_store;
+mod peer_transport;
 mod runtime;
 mod scoring;
 mod tx_broadcaster;
@@ -410,7 +412,7 @@ impl Node {
 			}
 		}
 
-		// Regularly reconnect to persisted peers.
+		// Reconnect independently: a slow Tor peer must not block attempts to other peers.
 		let connect_cm = Arc::clone(&self.connection_manager);
 		let connect_pm = Arc::clone(&self.peer_manager);
 		let connect_logger = Arc::clone(&self.logger);
@@ -419,66 +421,47 @@ impl Node {
 		self.runtime.spawn_cancellable_background_task(async move {
 			let mut interval = tokio::time::interval(PEER_RECONNECTION_INTERVAL);
 			interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-			// Alby: reconnection backoff for peers
-			let mut peer_retry_backoffs: HashMap<PublicKey, usize> = HashMap::new();
-			// Alby: reconnect iteration used to check if we should skip a reconnect attempt
-			let mut reconnect_iteration = 0;
+			let mut retries: HashMap<PublicKey, peer_retry::PeerRetry> = HashMap::new();
+			let mut connecting = std::collections::HashSet::new();
+			let mut attempts = tokio::task::JoinSet::new();
 			loop {
 				tokio::select! {
-						_ = stop_connect.changed() => {
-							log_debug!(
-								connect_logger,
-								"Stopping reconnecting known peers."
-							);
-							return;
-						}
-						_ = interval.tick() => {
-							reconnect_iteration += 1;
-							let pm_peers = connect_pm
-								.list_peers()
-								.iter()
-								.map(|peer| peer.counterparty_node_id)
-								.collect::<Vec<_>>();
-
-							for connected_peer in pm_peers.iter() {
-								// Alby: reset backoff for connected peers
-								// because this is not the only place
-								// a peer can be re-connected to (e.g.)
-								// a peer could initiate the connection to this node
-								peer_retry_backoffs.insert(*connected_peer, 0);
-							}
-
-							for peer_info in connect_peer_store.list_peers().iter().filter(|info| !pm_peers.contains(&info.node_id)) {
-								// Alby: backoff reconnection attempts backoff for connected peers
-								let peer_retry_backoff = peer_retry_backoffs.get(&peer_info.node_id).cloned().unwrap_or(0);
-								if peer_retry_backoff > 0 && reconnect_iteration % peer_retry_backoff != 0 {
-									log_debug!(connect_logger, "Skipping reconnecting to peer {} iteration {} backoff {}", peer_info.node_id, reconnect_iteration, peer_retry_backoff);
-									continue
-								}
-
-								let res = connect_cm.do_connect_peer(
-									peer_info.node_id,
-									peer_info.address.clone(),
-									).await;
-								match res {
-									Ok(_) => {
-										log_info!(connect_logger, "Successfully reconnected to peer {}", peer_info.node_id);
+					_ = stop_connect.changed() => {
+						log_debug!(connect_logger, "Stopping reconnecting known peers.");
+						return; // Dropping JoinSet cancels outstanding network waits.
+					},
+					Some(result) = attempts.join_next(), if !attempts.is_empty() => {
+						match result {
+							Ok((node_id, result)) => {
+								connecting.remove(&node_id);
+								match result {
+									Ok(()) => {
+										retries.remove(&node_id);
+										log_info!(connect_logger, "Successfully reconnected to peer {}", node_id);
 									},
-									Err(e) => {
-										// increase backoff randomly e.g. for the first 6 iterations:
-										// 1, [2-3], [3-5], [4-7], [5-9], [6-11], [7-13]
-										let mut new_peer_retry_backoff = peer_retry_backoff + 1;
-										new_peer_retry_backoff += rand::rng().random_range(0..new_peer_retry_backoff);
-										if new_peer_retry_backoff > 360 {
-											new_peer_retry_backoff = 360 // 360 * 10 seconds = approx 1 hour maximum backoff
-										}
-										log_error!(connect_logger, "Failed to reconnect to peer {}: {} backoff {} -> {}", peer_info.node_id, e, peer_retry_backoff, new_peer_retry_backoff);
-										peer_retry_backoffs.insert(peer_info.node_id, new_peer_retry_backoff);
-									}
+									Err(error) => {
+										let retry = peer_retry::PeerRetry::after_failure(retries.get(&node_id), Instant::now());
+										log_error!(connect_logger, "Failed to reconnect to peer {}: {}; retry after {} seconds", node_id, error, retry.delay_seconds());
+										retries.insert(node_id, retry);
+									},
 								}
-							}
+							},
+							Err(error) => log_error!(connect_logger, "Peer reconnect task failed: {}", error),
 						}
+					},
+					_ = interval.tick() => {
+						let peers = connect_pm.list_peers().iter().map(|peer| peer.counterparty_node_id).collect::<Vec<_>>();
+						for peer in &peers { retries.remove(peer); }
+						for peer in connect_peer_store.list_peers() {
+							if peers.contains(&peer.node_id) || connecting.contains(&peer.node_id)
+								|| retries.get(&peer.node_id).is_some_and(|retry| !retry.ready(Instant::now())) { continue; }
+							connecting.insert(peer.node_id);
+							let manager = Arc::clone(&connect_cm);
+							attempts.spawn(async move {
+								(peer.node_id, manager.connect_peer_if_necessary(peer.node_id, peer.address).await)
+							});
+						}
+					}
 				}
 			}
 		});
