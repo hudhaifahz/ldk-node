@@ -2046,8 +2046,16 @@ fn build_with_store_internal(
 		Arc::clone(&runtime),
 	);
 
-	let connection_manager =
-		Arc::new(ConnectionManager::new(Arc::clone(&peer_manager), Arc::clone(&logger)));
+	let proxy_routes =
+		crate::peer_transport::load_routes(&config.storage_dir_path).map_err(|error| {
+			log_error!(logger, "Failed to load peer transport configuration: {}", error);
+			BuildError::ReadFailed
+		})?;
+	let connection_manager = Arc::new(ConnectionManager::new(
+		Arc::clone(&peer_manager),
+		Arc::clone(&logger),
+		proxy_routes,
+	));
 
 	let output_sweeper = match io::utils::read_output_sweeper(
 		Arc::clone(&tx_broadcaster),
