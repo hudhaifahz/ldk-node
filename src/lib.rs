@@ -424,15 +424,17 @@ impl Node {
 			let mut retries: HashMap<PublicKey, peer_retry::PeerRetry> = HashMap::new();
 			let mut connecting = std::collections::HashSet::new();
 			let mut attempts = tokio::task::JoinSet::new();
+			let mut task_peers = HashMap::new();
 			loop {
 				tokio::select! {
 					_ = stop_connect.changed() => {
 						log_debug!(connect_logger, "Stopping reconnecting known peers.");
 						return; // Dropping JoinSet cancels outstanding network waits.
 					},
-					Some(result) = attempts.join_next(), if !attempts.is_empty() => {
+					Some(result) = attempts.join_next_with_id(), if !attempts.is_empty() => {
 						match result {
-							Ok((node_id, result)) => {
+							Ok((task_id, (node_id, result))) => {
+								task_peers.remove(&task_id);
 								connecting.remove(&node_id);
 								match result {
 									Ok(()) => {
@@ -446,7 +448,14 @@ impl Node {
 									},
 								}
 							},
-							Err(error) => log_error!(connect_logger, "Peer reconnect task failed: {}", error),
+							Err(error) => {
+								if let Some(node_id) = task_peers.remove(&error.id()) {
+									connecting.remove(&node_id);
+									let retry = peer_retry::PeerRetry::after_failure(retries.get(&node_id), Instant::now());
+									retries.insert(node_id, retry);
+								}
+								log_error!(connect_logger, "Peer reconnect task failed: {}", error);
+							},
 						}
 					},
 					_ = interval.tick() => {
@@ -457,9 +466,11 @@ impl Node {
 								|| retries.get(&peer.node_id).is_some_and(|retry| !retry.ready(Instant::now())) { continue; }
 							connecting.insert(peer.node_id);
 							let manager = Arc::clone(&connect_cm);
-							attempts.spawn(async move {
+							let node_id = peer.node_id;
+							let task = attempts.spawn(async move {
 								(peer.node_id, manager.connect_peer_if_necessary(peer.node_id, peer.address).await)
 							});
+							task_peers.insert(task.id(), node_id);
 						}
 					}
 				}

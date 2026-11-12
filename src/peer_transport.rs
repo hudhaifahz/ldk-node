@@ -105,7 +105,7 @@ async fn connect_with_timeout(route: &SocksRoute, timeout: Duration) -> io::Resu
 #[cfg(test)]
 mod tests {
 	use super::*;
-	const KEY: &str = "02c911ba09b21441200e0424279720ec13290b36cd51f4ab1a80cbb40b3baf0fe1";
+	const KEY: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 	fn route(proxy: SocketAddr) -> SocksRoute {
 		SocksRoute { proxy, host: format!("{}.onion", "a".repeat(56)), port: 9735 }
 	}

@@ -68,11 +68,18 @@ where
 
 		log_info!(self.logger, "Connecting to peer: {}@{}", node_id, addr);
 
+		// Always clear the pending entry, including when shutdown cancels this future.
+		let _pending_guard = PendingConnectionGuard { manager: self, node_id: Some(node_id) };
 		let connection_future = async {
-			let stream = if let Some(route) = self.proxy_routes.get(&node_id) {
+			if let Some(route) = self.proxy_routes.get(&node_id) {
 				// SOCKS success must precede setup_outbound, which starts LDK's handshake timer.
 				match peer_transport::connect(route).await {
-					Ok(stream) => stream,
+					Ok(stream) => Ok(Some(Box::pin(lightning_net_tokio::setup_outbound(
+						Arc::clone(&self.peer_manager),
+						node_id,
+						stream,
+					))
+						as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>)),
 					Err(error) => {
 						log_error!(
 							self.logger,
@@ -80,40 +87,31 @@ where
 							node_id,
 							error
 						);
-						return None;
+						Err(Error::ConnectionFailed)
 					},
 				}
 			} else {
-				let socket_addr =
-					match addr.to_socket_addrs().ok().and_then(|mut addrs| addrs.next()) {
-						Some(addr) => addr,
-						None => {
-							log_error!(self.logger, "Failed to resolve network address {}", addr);
-							return None;
-						},
-					};
-				match tokio::time::timeout(
-					Duration::from_secs(10),
-					tokio::net::TcpStream::connect(socket_addr),
+				// Preserve the normal resolver, error contract and direct TCP transport.
+				let socket_addr = addr
+					.to_socket_addrs()
+					.map_err(|_| Error::InvalidSocketAddress)?
+					.next()
+					.ok_or(Error::InvalidSocketAddress)?;
+				Ok(lightning_net_tokio::connect_outbound(
+					Arc::clone(&self.peer_manager),
+					node_id,
+					socket_addr,
 				)
 				.await
-				{
-					Ok(Ok(stream)) => match stream.into_std() {
-						Ok(stream) => stream,
-						Err(_) => return None,
-					},
-					_ => return None,
-				}
-			};
-			Some(lightning_net_tokio::setup_outbound(
-				Arc::clone(&self.peer_manager),
-				node_id,
-				stream,
-			))
+				.map(|future| {
+					Box::pin(future)
+						as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+				}))
+			}
 		};
 
 		let res = match connection_future.await {
-			Some(connection_closed_future) => {
+			Ok(Some(connection_closed_future)) => {
 				let mut connection_closed_future = Box::pin(connection_closed_future);
 				loop {
 					tokio::select! {
@@ -130,13 +128,14 @@ where
 					}
 				}
 			},
-			None => {
+			Err(error) => Err(error),
+			Ok(None) => {
 				log_error!(self.logger, "Failed to connect to peer: {}@{}", node_id, addr);
 				Err(Error::ConnectionFailed)
 			},
 		};
 
-		self.propagate_result_to_subscribers(&node_id, res);
+		_pending_guard.complete(res);
 
 		res
 	}
@@ -163,19 +162,38 @@ where
 		let mut pending_connections_lock = self.pending_connections.lock().unwrap();
 		if let Some(connection_ready_senders) = pending_connections_lock.remove(node_id) {
 			for sender in connection_ready_senders {
-				let _ = sender.send(res).map_err(|e| {
-					debug_assert!(
-						false,
-						"Failed to send connection result to subscribers: {:?}",
-						e
-					);
-					log_error!(
-						self.logger,
-						"Failed to send connection result to subscribers: {:?}",
-						e
-					);
-				});
+				let _ = sender.send(res);
 			}
+		}
+	}
+}
+
+// Dropping an in-flight connection releases waiters and permits a later retry.
+struct PendingConnectionGuard<'a, L: Deref + Clone + Sync + Send>
+where
+	L::Target: LdkLogger,
+{
+	manager: &'a ConnectionManager<L>,
+	node_id: Option<PublicKey>,
+}
+impl<L: Deref + Clone + Sync + Send> Drop for PendingConnectionGuard<'_, L>
+where
+	L::Target: LdkLogger,
+{
+	fn drop(&mut self) {
+		if let Some(node_id) = self.node_id.take() {
+			self.manager.propagate_result_to_subscribers(&node_id, Err(Error::ConnectionFailed));
+		}
+	}
+}
+
+impl<L: Deref + Clone + Sync + Send> PendingConnectionGuard<'_, L>
+where
+	L::Target: LdkLogger,
+{
+	fn complete(mut self, result: Result<(), Error>) {
+		if let Some(node_id) = self.node_id.take() {
+			self.manager.propagate_result_to_subscribers(&node_id, result);
 		}
 	}
 }
